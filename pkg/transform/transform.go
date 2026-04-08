@@ -1,11 +1,9 @@
 package transform
 
 func Encode(input string) string {
-	result := make([]byte, len(input))
+	humorousMessage := "desu ka?"
 
-	for index := range input {
-		result[index] = input[index] + 1
-	}
+	result := input + " - " + humorousMessage
 
 	return string(result)
 }

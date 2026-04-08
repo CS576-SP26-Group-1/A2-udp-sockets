@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,9 +14,10 @@ import (
 const (
 	// default values
 	MESSAGE_DEFAULT     = "Hello World"
-	BYTE_LIMIT_DEFAULT  = 256
-	LISTEN_PORT_DEFAULT = ":8080"
-	PROTO_DEFAULT       = "tcp"
+	BYTE_LIMIT_DEFAULT  = 4096
+	LISTEN_PORT_DEFAULT = ":0"
+	SEND_PORT_DEFAULT   = ":8080"
+	PROTO_DEFAULT       = "udp"
 	INTERACTIVE_DEFAULT = false
 	COLOR_DEFAULT       = true
 	// usage flag help (shown with `-h` flag)
@@ -32,32 +32,29 @@ const (
 type ClientRuntimeContext struct {
 	message         string
 	protocol        string
+	sendPort        string
 	listenPort      string
 	byteLimit       int
 	interactiveMode bool
 	color           bool
 }
 
-func sendMessage(crContext ClientRuntimeContext, conn net.Conn) error {
+func sendMessage(crContext ClientRuntimeContext, conn *net.UDPConn, addr *net.UDPAddr) error {
 	// push message to remote server
-
-	// the write to the server here needs a `\n` to guarantee that the server
-	// bothers to parse it (especially in one-shot that doesn't use newlines)
-	// instead of just reading it infinitely
-	_, err := fmt.Fprintf(conn, "%s\n", crContext.message)
+	_, err := conn.WriteToUDP([]byte(crContext.message), addr)
 	if err != nil {
 		return fmt.Errorf("failed to write to remote server: %w", err)
 	}
-
-	// Prepare to accept the response of the server
-	reader := bufio.NewReader(conn)
 
 	// read response from remote server
 	// probably should do some reasonable timeout because this will be a problem
 	// if the server forgets to add a newline
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
-	response, err := reader.ReadString('\n')
+	// Prepare to accept the response of the server
+	buf := make([]byte, crContext.byteLimit)
+	_, _, err = conn.ReadFromUDP(buf)
+
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			return fmt.Errorf("server response timed out")
@@ -66,29 +63,35 @@ func sendMessage(crContext ClientRuntimeContext, conn net.Conn) error {
 		return fmt.Errorf("failed to read server response: %w", err)
 	}
 
+	response := string(buf)
+
 	// reset deadline
 	conn.SetDeadline(time.Time{})
 
 	// server response
 	if crContext.color {
-		fmt.Printf("\033[1m\033[33mMessage returned:\033[0m %s", response)
+		fmt.Printf("\033[1m\033[33mMessage returned:\033[0m %s\n", response)
 	} else {
-		fmt.Printf("Message returned: %s", response)
+		fmt.Printf("Message returned: %s\n", response)
 	}
 
 	return nil
 }
 
 func runClient(crContext ClientRuntimeContext) error {
-	// implement a TCP client as a Dialer?
-	var dialer net.Dialer
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+	homeAddr, addrErr := net.ResolveUDPAddr(crContext.protocol, crContext.listenPort)
+	if addrErr != nil {
+		return fmt.Errorf("failed to calculate local network addr: %w", addrErr)
+	}
 
-	// open connection to remove server
-	conn, err := dialer.DialContext(ctx, crContext.protocol, crContext.listenPort)
-	if err != nil {
-		return fmt.Errorf("failed to connect to remote server: %w", err)
+	destAddr, addrErr := net.ResolveUDPAddr(crContext.protocol, crContext.sendPort)
+	if addrErr != nil {
+		return fmt.Errorf("failed to calculate destination network addr: %w", addrErr)
+	}
+
+	conn, listenErr := net.ListenUDP(crContext.protocol, homeAddr)
+	if listenErr != nil {
+		return fmt.Errorf("failed to open UDP socket: %w", addrErr)
 	}
 
 	if crContext.interactiveMode {
@@ -108,7 +111,7 @@ func runClient(crContext ClientRuntimeContext) error {
 			// original `-message` contents don't matter, so we override it with the new input
 			// and pass it to the sendMessage as usual
 			crContext.message = stdIn.Text()
-			err := sendMessage(crContext, conn)
+			err := sendMessage(crContext, conn, destAddr)
 			if err != nil {
 				return err
 			}
@@ -121,16 +124,16 @@ func runClient(crContext ClientRuntimeContext) error {
 		}
 	} else {
 		// one-shot mode: read in `-message` and send that off to the server
-		err := sendMessage(crContext, conn)
+		err := sendMessage(crContext, conn, destAddr)
 		if err != nil {
 			return err
 		}
 	}
 
-	// cleanup TCP connection
-	err = conn.Close()
+	// cleanup UDP connection
+	err := conn.Close()
 	if err != nil {
-		return fmt.Errorf("failed to close connection: %w", err)
+		return fmt.Errorf("failed to close UDP socket: %w", err)
 	}
 
 	return nil
@@ -140,7 +143,8 @@ func runClient(crContext ClientRuntimeContext) error {
 func parseArgs() *ClientRuntimeContext {
 	message := flag.String("message", MESSAGE_DEFAULT, MESSAGE_USAGE)
 	protcol := flag.String("proto", PROTO_DEFAULT, PROTO_USAGE)
-	listenPort := flag.String("port", LISTEN_PORT_DEFAULT, LISTEN_PORT_USAGE)
+	listenPort := flag.String("lport", LISTEN_PORT_DEFAULT, LISTEN_PORT_USAGE)
+	sendPort := flag.String("dport", SEND_PORT_DEFAULT, LISTEN_PORT_USAGE)
 	byteLimit := flag.Int("blimit", BYTE_LIMIT_DEFAULT, BYTE_LIMIT_USAGE)
 	interactiveMode := flag.Bool("interactive", INTERACTIVE_DEFAULT, INTERACTIVE_USAGE)
 	color := flag.Bool("color", COLOR_DEFAULT, COLOR_USAGE)
@@ -151,6 +155,7 @@ func parseArgs() *ClientRuntimeContext {
 		message:         *message,
 		protocol:        *protcol,
 		listenPort:      *listenPort,
+		sendPort:        *sendPort,
 		byteLimit:       *byteLimit,
 		interactiveMode: *interactiveMode,
 		color:           *color,

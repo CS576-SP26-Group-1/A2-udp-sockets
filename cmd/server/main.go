@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bufio"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -17,7 +14,7 @@ const (
 	// default values
 	BYTE_LIMIT_DEFAULT      = 256
 	LISTEN_PORT_DEFAULT     = ":8080"
-	PROTO_DEFAULT           = "tcp"
+	PROTO_DEFAULT           = "udp"
 	MAX_DRAIN_COUNT_DEFAULT = 3
 	// flag names
 	ENCODE_FLAG = "encode"
@@ -40,118 +37,32 @@ type ServerRuntimeContext struct {
 }
 
 // per-message client message handler
-func handleUserResponse(ctx ServerRuntimeContext, c net.Conn, reportingChan chan error) {
-	defer func() {
-		// close the connection cleanly, or if that fails, report it
-		closeErr := c.Close()
-		if closeErr != nil {
-			closeErr = fmt.Errorf("failed to close %s connection cleanly: %w", ctx.protocol, closeErr)
-			reportingChan <- closeErr // reportingChan wa kyou mou kawaii~!!
-			return
-		}
-	}()
+func handleUserResponse(ctx ServerRuntimeContext, c *net.UDPConn, reportingChan chan error, buf []byte, addr *net.UDPAddr) {
+	// since our buffer is ctx.byteLimit+1, we know that, once we strip the newline, we have byteLimit characters (<=256)
+	// remove the automatically added newline character
+	message := strings.TrimRight(string(buf), "\n") // apparently Windows sends carriage returns... I don't like accomodating for Windows...
 
-	reader := bufio.NewReaderSize(c, ctx.byteLimit+1) // need +1 for the automatic newline added by the client
+	// perform encoding/decoding on client
+	transformedMessage := ctx.transformFunc(message)
 
-	// need to handle client interactive mode, so we read the connection in a loop up to every newline
-	for {
-		// read stream up to a newline character
-		line, readErr := reader.ReadSlice('\n')
+	fmt.Printf("message: %s, encoded: %s\n", message, transformedMessage)
 
-		if readErr == nil {
-			// since our buffer is ctx.byteLimit+1, we know that, once we strip the newline, we have byteLimit characters (<=256)
-			// remove the automatically added newline character
-			message := strings.TrimRight(string(line), "\n") // apparently Windows sends carriage returns... I don't like accomodating for Windows...
-
-			// perform encoding/decoding on client
-			transformedMessage := ctx.transformFunc(message)
-
-			fmt.Printf("message: %s, encoded: %s\n", message, transformedMessage)
-
-			// apparently we can use fmt.Fprintf instead of net.conn.Write since net.conn is a writer
-			// pretty neat....
-			// write the encoded (or decoded) response back to the client
-			_, readErr = fmt.Fprintf(c, "%s\n", transformedMessage)
-			if readErr != nil {
-				reportingChan <- fmt.Errorf("failed to write response: %w", readErr)
-				return
-			}
-		}
-
-		if errors.Is(readErr, io.EOF) {
-			// EOF is sent by client on disconnect, so it's not quite an error
-			// that would be worth reporting
-			return
-		}
-
-		// if the buffer fills without a newline, we can assume that the message
-		// is longer than 256 characters (or blimit)
-		if errors.Is(readErr, bufio.ErrBufferFull) {
-			// if we had a super long messsage come in that does have a new line,
-			// we need this guard clause here to fully drain the message before
-			// resetting
-
-			// report a non-fatal error to the server logs and the client if the client sends a message
-			// longer than 256 characters
-			// since we have a fixed buffer size, we will only ever read byteLimit, so we can only
-			// report what we wanted from the client, not how much the client actually sent
-			oversizeErr := fmt.Sprintf("bad request from client: message exceeded server's byte limit (wanted: %d)\n", ctx.byteLimit)
-			fmt.Print(oversizeErr)
-			_, _ = fmt.Fprint(c, oversizeErr)
-
-			isDrained := false
-			drainCount := 0
-
-			// attempt to drain the connection of the big message until we give up
-			for !isDrained && drainCount < ctx.maxDrainCount { // I can't believe Golang doens't have a while loop keyword...
-				_, drainErr := reader.ReadSlice('\n')
-
-				// cases:
-				// - no error: found newline, drained successfully
-				// - EOF: client disconnected, can't fix this
-				// - buffer full: client must be a yapper
-				// - some other error: I have no clue what happened. It's probably unrecoverable.
-				if drainErr == nil {
-					// found the newline, big message was drained
-					isDrained = true // in a for-loop, we could break, but I hate break!
-				} else if errors.Is(drainErr, io.EOF) {
-					// EOF is sent by client on disconnect, so it's not quite an error
-					return
-				} else if errors.Is(drainErr, bufio.ErrBufferFull) {
-					drainCount++
-					continue
-				} else {
-					// whatever error this was, it must've been really bad
-					reportingChan <- fmt.Errorf("failed to drain message: %w", drainErr)
-					return
-				}
-			}
-
-			if !isDrained {
-				// whatever the client sent must be malformed (no newline) or they're trying to be
-				// really annoying with a stupidly large message
-				oversizeErr := "disconnected client due to super bad request from client: failed to drain message\n"
-				fmt.Print(oversizeErr)
-				_, _ = fmt.Fprint(c, oversizeErr)
-				return
-			}
-
-			// don't want to hit that last clause in this function... might be bad :P
-			continue
-		}
-
-		if readErr != nil {
-			// must've been some fatal error that happened with the reader
-			reportingChan <- fmt.Errorf("failed to read from client: %w", readErr)
-			return
-		}
+	_, writeErr := c.WriteToUDP([]byte(transformedMessage), addr)
+	if writeErr != nil {
+		reportingChan <- fmt.Errorf("failed to write response: %w", writeErr)
+		return
 	}
+
 }
 
 // long-lasting function to listen for messages until executation is interrupted
 func runServer(srContext ServerRuntimeContext) error {
-	var err error
-	listener, err := net.Listen(srContext.protocol, srContext.listenPort)
+	addr, addrErr := net.ResolveUDPAddr(srContext.protocol, srContext.listenPort)
+	if addrErr != nil {
+		return fmt.Errorf("failed to calculate network addr: %w", addrErr)
+	}
+
+	conn, err := net.ListenUDP(srContext.protocol, addr)
 	if err != nil {
 		return fmt.Errorf("failed to create socket: %w", err)
 	}
@@ -166,7 +77,7 @@ func runServer(srContext ServerRuntimeContext) error {
 	// teardown logic for the listener
 	defer func() {
 		// I assume the chan will get closed on program exit, along with the goroutines.
-		closeErr := listener.Close() // always close listener before process exits.
+		closeErr := conn.Close() // always close listener before process exits.
 		if closeErr != nil {
 			err = fmt.Errorf("failed to close %s listener: %w", srContext.protocol, closeErr)
 		}
@@ -181,26 +92,13 @@ func runServer(srContext ServerRuntimeContext) error {
 
 	// Loop infinitely for pending connections
 	for {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			var opErr *net.OpError
-			if errors.As(acceptErr, &opErr) && opErr.Temporary() {
-				// don't want to fall over if the error is transient
-				// should cover timeouts and what-not (ECONNRESET, ECONNABORTED)
-				// technically shouldn't use Temporary() since it's deprecated
-				// but I don't know the alternative off the top of my head
-				// https://cs.opensource.google/go/go/+/refs/tags/go1.26.0:src/net/net.go;l=552
-				log.Printf("non-fatal issue occured during connection accept: %s\n", opErr)
-				continue
-			} else {
-				return fmt.Errorf("fatal issue occured while accepting request: %w", acceptErr)
-			}
+		buf := make([]byte, srContext.byteLimit)
+		_, addr, packetReadErr := conn.ReadFromUDP(buf)
+		if packetReadErr != nil {
+			reportingChannel <- fmt.Errorf("failed to read client packet: %w", packetReadErr)
 		}
 
-		// in "net" package example, connection is handled in a
-		// concurrent goroutine while the server continues listening
-		// for more acceptions. Do we want this in our implementation?
-		go handleUserResponse(srContext, conn, reportingChannel)
+		go handleUserResponse(srContext, conn, reportingChannel, buf, addr)
 	}
 }
 
