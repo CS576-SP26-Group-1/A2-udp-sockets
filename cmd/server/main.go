@@ -12,7 +12,7 @@ import (
 // is it fine that this is out of main scope?
 const (
 	// default values
-	BYTE_LIMIT_DEFAULT      = 256
+	BYTE_LIMIT_DEFAULT      = 4096
 	LISTEN_PORT_DEFAULT     = ":8080"
 	PROTO_DEFAULT           = "udp"
 	MAX_DRAIN_COUNT_DEFAULT = 3
@@ -37,10 +37,10 @@ type ServerRuntimeContext struct {
 }
 
 // per-message client message handler
-func handleUserResponse(ctx ServerRuntimeContext, c *net.UDPConn, reportingChan chan error, buf []byte, addr *net.UDPAddr) {
+func handleUserResponse(ctx ServerRuntimeContext, c *net.UDPConn, reportingChan chan error, msg string, addr *net.UDPAddr) {
 	// since our buffer is ctx.byteLimit+1, we know that, once we strip the newline, we have byteLimit characters (<=256)
 	// remove the automatically added newline character
-	message := strings.TrimRight(string(buf), "\n") // apparently Windows sends carriage returns... I don't like accomodating for Windows...
+	message := strings.TrimRight(msg, "\n") // apparently Windows sends carriage returns... I don't like accomodating for Windows...
 
 	// perform encoding/decoding on client
 	transformedMessage := ctx.transformFunc(message)
@@ -93,12 +93,13 @@ func runServer(srContext ServerRuntimeContext) error {
 	// Loop infinitely for pending connections
 	for {
 		buf := make([]byte, srContext.byteLimit)
-		_, addr, packetReadErr := conn.ReadFromUDP(buf)
+		n, addr, packetReadErr := conn.ReadFromUDP(buf)
 		if packetReadErr != nil {
 			reportingChannel <- fmt.Errorf("failed to read client packet: %w", packetReadErr)
 		}
+		msg := string(buf[:n])
 
-		go handleUserResponse(srContext, conn, reportingChannel, buf, addr)
+		go handleUserResponse(srContext, conn, reportingChannel, msg, addr)
 	}
 }
 

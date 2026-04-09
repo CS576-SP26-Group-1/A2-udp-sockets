@@ -53,7 +53,7 @@ func sendMessage(crContext ClientRuntimeContext, conn *net.UDPConn, addr *net.UD
 
 	// Prepare to accept the response of the server
 	buf := make([]byte, crContext.byteLimit)
-	_, _, err = conn.ReadFromUDP(buf)
+	n, _, err := conn.ReadFromUDP(buf)
 
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -63,7 +63,7 @@ func sendMessage(crContext ClientRuntimeContext, conn *net.UDPConn, addr *net.UD
 		return fmt.Errorf("failed to read server response: %w", err)
 	}
 
-	response := string(buf)
+	response := string(buf[:n])
 
 	// reset deadline
 	conn.SetDeadline(time.Time{})
